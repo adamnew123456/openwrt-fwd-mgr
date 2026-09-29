@@ -38,25 +38,35 @@ func openSSHConnection(server string, port int, user string) (*ssh.Client, error
 	return sshClient, nil
 }
 
-func listUCIFirewallRules(client *ssh.Client) ([]*dnatRule, error) {
+func runShellCommand(client *ssh.Client, command string) (stdout, stderr []byte, err error) {
 	session, err := client.NewSession()
 	if err != nil {
-		return nil, fmt.Errorf("Could not open shell session: %s", err.Error())
+		return nil, nil, fmt.Errorf("Could not open shell session: %s", err.Error())
 	}
 	defer session.Close()
 
 	var outBuf, errBuf bytes.Buffer
 	session.Stdout = &outBuf
 	session.Stderr = &errBuf
-	err = session.Run(fmt.Sprintf("uci show firewall"))
+	fmt.Printf("$ %s\n", command)
+	err = session.Run(command)
 	if err != nil {
-		if errBuf.Len() > 0 {
-			fmt.Printf("Received UCI error: %s\n", string(errBuf.Bytes()))
+		return outBuf.Bytes(), errBuf.Bytes(), fmt.Errorf("Error running command: %s\n", err.Error())
+	} else {
+		return outBuf.Bytes(), errBuf.Bytes(), nil
+	}
+}
+
+func listUCIFirewallRules(client *ssh.Client) ([]*dnatRule, error) {
+	stdout, stderr, err := runShellCommand(client, "uci show firewall")
+	if err != nil {
+		if stderr != nil && len(stderr) > 0 {
+			fmt.Printf("Received UCI error: %s\n", string(stderr))
 		}
-		return nil, fmt.Errorf("Error running `uci show firewall`: %s\n", err.Error())
+		return nil, err
 	}
 
-	return parseUCIDNATRules(bytes.NewReader(outBuf.Bytes()))
+	return parseUCIDNATRules(bytes.NewReader(stdout))
 }
 
 func toggleUCIFirewallRules(client *ssh.Client, rules []*dnatRule, enable bool) error {
@@ -66,73 +76,72 @@ func toggleUCIFirewallRules(client *ssh.Client, rules []*dnatRule, enable bool) 
 	}
 
 	var err error
-	var outBuf, errBuf bytes.Buffer
 	for _, rule := range rules {
-		(func() {
-			session, err := client.NewSession()
-			if err != nil {
-				err = fmt.Errorf("Could not open shell session: %s", err.Error())
+		command := fmt.Sprintf("uci set 'firewall.@redirect[%d].enabled=%d'", rule.num, status)
+		if _, stderr, err := runShellCommand(client, command); err != nil {
+			revertUCIFirewallRules(client)
+			if stderr != nil && len(stderr) > 0 {
+				fmt.Printf("Received UCI error: %s\n", string(stderr))
 			}
-			defer session.Close()
-
-			outBuf.Reset()
-			errBuf.Reset()
-			session.Stdout = &outBuf
-			session.Stderr = &errBuf
-
-			command := fmt.Sprintf("uci set 'firewall.@redirect[%d].enabled=%d'", rule.num, status)
-			fmt.Printf("$ %s\n", command)
-			err = session.Run(command)
-			if err != nil {
-				revertUCIFirewallRules(client)
-
-				if errBuf.Len() > 0 {
-					fmt.Printf("Received UCI error: %s\n", string(errBuf.Bytes()))
-				}
-				err = fmt.Errorf("Error running `%s`: %s\n", command, err.Error())
-			}
-		})()
+			return err
+		}
 	}
 
-	errBuf.Reset()
-	err = commitUCIFirewallRules(client)
-	if err != nil {
+	if err = commitUCIFirewallRules(client); err != nil {
 		revertUCIFirewallRules(client)
 		return err
 	}
 
+	restartFirewallService(client)
 	return nil
 }
 
 func commitUCIFirewallRules(client *ssh.Client) error {
-	session, err := client.NewSession()
+	_, stderr, err := runShellCommand(client, "uci commit firewall")
 	if err != nil {
-		return fmt.Errorf("Could not open shell session: %s", err.Error())
-	}
-	defer session.Close()
-
-	var errBuf bytes.Buffer
-	session.Stderr = &errBuf
-	fmt.Println("$ uci commit firewall")
-	err = session.Run("uci commit firewall")
-	if err != nil {
-		if errBuf.Len() > 0 {
-			fmt.Printf("Received UCI error: %s\n", string(errBuf.Bytes()))
+		if stderr != nil && len(stderr) > 0 {
+			fmt.Printf("Received UCI error: %s\n", string(stderr))
 		}
-		return fmt.Errorf("Error running `uci commit firewall`: %s\n", err.Error())
+		return err
 	}
 	return nil
 }
 
-func revertUCIFirewallRules(client *ssh.Client) {
-	session, err := client.NewSession()
-	if err != nil {
-		return
-	}
+// Neither restarting the firewall nor reverting the firewall rules can
+// meaningfully fail:
+//
+// - Restarting the firewall service happens after the new rules are
+//   committed. We can't undo the rules at that point without risking
+//   more errors, let the operator know to restart the service by hand.
+//
+// - Reverting the firewall rules leaves the pending rule changes
+//   in an unknown state. UCI may be broken which again requires operator
+//   intervention.
 
-	defer session.Close()
-	fmt.Println("$ uci revert firewall")
-	session.Run("uci revert firewall")
+func restartFirewallService(client *ssh.Client) {
+	_, stderr, err := runShellCommand(client, "service firewall restart")
+	if err != nil {
+		if stderr != nil && len(stderr) > 0 {
+			fmt.Printf("Received UCI error: %s\n", string(stderr))
+		}
+		fmt.Println(`
+Firewall rules committed but not in effect. Restart the firewall service by hand
+and diagnose any issues.`)
+	}
+}
+
+func revertUCIFirewallRules(client *ssh.Client) {
+	_, stderr, err := runShellCommand(client, "uci revert firewall")
+	if err != nil {
+		if stderr != nil && len(stderr) > 0 {
+			fmt.Printf("Received UCI error: %s\n", string(stderr))
+		}
+		fmt.Printf("Unable to revert firewall rules: %s\n", err.Error())
+		fmt.Println(`
+UCI has pending firewall config changes that could not be applied. Review them
+using the 'uci' command line tool and revert/apply by hand as necessary.
+`)
+	}
 }
 
 func filterRules(rules []*dnatRule, matchers []ruleMatch) ([]*dnatRule, error) {
